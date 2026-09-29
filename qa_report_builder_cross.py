@@ -299,8 +299,14 @@ class TableSide:
         entire huge result set in memory at once before fetching begins."""
         cur = self.adapter.large_result_cursor(self.conn)
         cur.execute(sql)
-        cols = [d[0].upper() for d in cur.description]
+        # A named (server-side) cursor's .description is not reliably
+        # populated until AFTER the first fetch -- psycopg2 only learns the
+        # result columns once an actual FETCH runs against the server-side
+        # cursor, not from DECLARE CURSOR alone. Reading it before fetching
+        # (as run()'s plain-cursor path safely can) returns None here and
+        # crashes. Fetch first, then read description.
         rows = cur.fetchall()
+        cols = [d[0].upper() for d in cur.description]
         cur.close()
         return cols, rows
 
