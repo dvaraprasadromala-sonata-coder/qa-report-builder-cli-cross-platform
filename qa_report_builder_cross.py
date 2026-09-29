@@ -149,6 +149,12 @@ class SnowflakeAdapter:
         parts = [f"COALESCE(TRIM({self.cast_text(c)}), '{NULL_SENTINEL}')" for c in cols]
         return build_concat_ws_checksum(parts)
 
+    def large_result_cursor(self, conn):
+        # snowflake-connector-python already streams results in batches
+        # internally, so the default cursor is fine even for tens of
+        # millions of rows.
+        return conn.cursor()
+
     def quote(self, ident):
         return ident  # unquoted identifiers are fine; we always work in uppercase
 
@@ -172,7 +178,15 @@ class PostgresAdapter:
         user = env_or_ask(env_values, "  User", "POSTGRES_USER")
         password = env_or_ask_password(env_values, "  Password", "POSTGRES_PASSWORD")
         conn = psycopg2.connect(host=host, port=port, dbname=dbname, user=user, password=password)
-        conn.autocommit = True
+        # autocommit deliberately NOT set here (default is off, i.e. one
+        # long-lived read-only transaction for the whole run) -- a named
+        # (server-side) cursor, used below for the checksum fetch, only
+        # survives across multiple internal FETCH calls while its
+        # DECLARE-ing transaction stays open. Under autocommit=True each
+        # statement is its own auto-committed transaction, which would
+        # invalidate the cursor between batches. Every query this script
+        # runs is a SELECT, so holding one transaction open for the run's
+        # duration is safe -- there's nothing to roll back.
         return conn
 
     def cast_text(self, col):
@@ -181,6 +195,22 @@ class PostgresAdapter:
     def checksum_expr(self, cols):
         parts = [f"COALESCE(TRIM({self.cast_text(c)}), '{NULL_SENTINEL}')" for c in cols]
         return build_concat_ws_checksum(parts)
+
+    def large_result_cursor(self, conn):
+        # A plain (unnamed) psycopg2 cursor makes libpq buffer the ENTIRE
+        # result set in memory before Python ever sees a single row --
+        # fine for a handful of rows, but a full-table checksum fetch on a
+        # table with tens of millions of rows can exhaust available memory
+        # before fetchall() is even called, raising "out of memory for
+        # query result" from deep inside libpq itself (a real failure seen
+        # running this against a 23M-row, 474-column table). A named
+        # (server-side) cursor instead asks the server to hold the result
+        # set and streams it back in itersize-sized batches on demand,
+        # keeping client-side memory bounded regardless of table size.
+        import uuid
+        cur = conn.cursor(name=f"qa_checksum_cursor_{uuid.uuid4().hex}")
+        cur.itersize = 50_000
+        return cur
 
     def quote(self, ident):
         return f'"{ident}"'
@@ -209,6 +239,17 @@ class RedshiftAdapter(PostgresAdapter):
         conn = redshift_connector.connect(host=host, port=int(port), database=dbname, user=user, password=password)
         conn.autocommit = True
         return conn
+
+    def large_result_cursor(self, conn):
+        # redshift_connector doesn't support named/server-side cursors the
+        # way psycopg2 does, so this falls back to a regular cursor
+        # (inherited PostgresAdapter behavior would try a named cursor,
+        # which redshift_connector's cursor() doesn't accept). Redshift
+        # clusters are typically provisioned with far more memory headroom
+        # than a Postgres ODS host or a client laptop, so this class of
+        # failure is less likely here -- if it does show up on Redshift,
+        # this is the place to add real batching.
+        return conn.cursor()
 
 
 ENGINE_ADAPTERS = {"snowflake": SnowflakeAdapter, "postgres": PostgresAdapter, "redshift": RedshiftAdapter}
@@ -250,7 +291,29 @@ class TableSide:
         cur.close()
         return cols, rows
 
+    def run_large(self, sql):
+        """Like run(), but for a query that may return millions of rows --
+        currently just the full-table checksum fetch. Uses a streaming
+        cursor where the adapter provides one (see each adapter's
+        large_result_cursor()), so the client never has to buffer an
+        entire huge result set in memory at once before fetching begins."""
+        cur = self.adapter.large_result_cursor(self.conn)
+        cur.execute(sql)
+        cols = [d[0].upper() for d in cur.description]
+        rows = cur.fetchall()
+        cur.close()
+        return cols, rows
+
     def close(self):
+        # Postgres connections in this tool run without autocommit (see
+        # PostgresAdapter.connect()), so the whole run sits in one
+        # long-lived read-only transaction -- commit() just closes it out
+        # cleanly. A no-op on engines that don't need this (Snowflake,
+        # Redshift under autocommit), since there's nothing pending.
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
         self.conn.close()
 
 
@@ -363,7 +426,7 @@ def fetch_checksums(side, columns, join_key, breakdown_column=None):
     select_cols = [join_key, f"{checksum_sql} AS ROW_CHECKSUM"]
     if breakdown_column:
         select_cols.append(breakdown_column)
-    _, rows = side.run(f"SELECT {', '.join(select_cols)} FROM {side.fqn}")
+    _, rows = side.run_large(f"SELECT {', '.join(select_cols)} FROM {side.fqn}")
 
     if not breakdown_column:
         return {r[0]: r[1] for r in rows}, None
