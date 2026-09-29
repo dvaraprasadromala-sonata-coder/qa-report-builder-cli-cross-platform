@@ -97,6 +97,31 @@ NULL_SENTINEL = "‡‡__QA_NULL_SENTINEL_9f3c7a1e2b8d__‡‡"  # a rare Unicod
 # differ across dialects: casting a column to text, and a NULL-safe
 # concat_ws-based row checksum. Everything above this layer is engine-agnostic.
 
+CHECKSUM_ARGS_PER_CONCAT = 90  # PostgreSQL (and Redshift) cap every function call at 100
+                                 # arguments -- a flat CONCAT_WS('|', col1, col2, ...) on a
+                                 # wide table (400+ columns) blows past that limit in one
+                                 # call. Nesting CONCAT_WS calls in chunks under this
+                                 # cap produces the EXACT same joined string as one giant call
+                                 # would: CONCAT_WS('|', already-'|'-joined chunk strings)
+                                 # reproduces the flat join, so this changes nothing about the
+                                 # checksum algorithm or cross-engine comparability -- only how
+                                 # the SQL expression is shaped to stay under the limit. 90
+                                 # leaves headroom under 100 for the outer wrapping call.
+
+
+def build_concat_ws_checksum(parts):
+    """Builds MD5(CONCAT_WS('|', ...)) safely regardless of column count, by
+    nesting CONCAT_WS calls in chunks of CHECKSUM_ARGS_PER_CONCAT. Applied
+    identically on every engine (not just the ones with a real argument
+    limit) so a checksum stays comparable across engines regardless of which
+    side happened to need chunking."""
+    if len(parts) <= CHECKSUM_ARGS_PER_CONCAT:
+        return f"MD5(CONCAT_WS('|', {', '.join(parts)}))"
+    chunks = [parts[i:i + CHECKSUM_ARGS_PER_CONCAT] for i in range(0, len(parts), CHECKSUM_ARGS_PER_CONCAT)]
+    chunk_exprs = [f"CONCAT_WS('|', {', '.join(chunk)})" for chunk in chunks]
+    return f"MD5(CONCAT_WS('|', {', '.join(chunk_exprs)}))"
+
+
 class SnowflakeAdapter:
     name = "snowflake"
 
@@ -122,7 +147,7 @@ class SnowflakeAdapter:
 
     def checksum_expr(self, cols):
         parts = [f"COALESCE(TRIM({self.cast_text(c)}), '{NULL_SENTINEL}')" for c in cols]
-        return f"MD5(CONCAT_WS('|', {', '.join(parts)}))"
+        return build_concat_ws_checksum(parts)
 
     def quote(self, ident):
         return ident  # unquoted identifiers are fine; we always work in uppercase
@@ -155,7 +180,7 @@ class PostgresAdapter:
 
     def checksum_expr(self, cols):
         parts = [f"COALESCE(TRIM({self.cast_text(c)}), '{NULL_SENTINEL}')" for c in cols]
-        return f"MD5(CONCAT_WS('|', {', '.join(parts)}))"
+        return build_concat_ws_checksum(parts)
 
     def quote(self, ident):
         return f'"{ident}"'
