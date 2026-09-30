@@ -99,8 +99,8 @@ NULL_SENTINEL = "‡‡__QA_NULL_SENTINEL_9f3c7a1e2b8d__‡‡"  # a rare Unicod
 
 CHECKSUM_ARGS_PER_CONCAT = 90  # PostgreSQL (and Redshift) cap every function call at 100
                                  # arguments -- a flat CONCAT_WS('|', col1, col2, ...) on a
-                                 # wide table (400+ columns) blows past that limit in one
-                                 # call. Nesting CONCAT_WS calls in chunks under this
+                                 # wide table (400+ columns) blows past that
+                                 # in one call. Nesting CONCAT_WS calls in chunks under this
                                  # cap produces the EXACT same joined string as one giant call
                                  # would: CONCAT_WS('|', already-'|'-joined chunk strings)
                                  # reproduces the flat join, so this changes nothing about the
@@ -299,13 +299,23 @@ class TableSide:
         entire huge result set in memory at once before fetching begins."""
         cur = self.adapter.large_result_cursor(self.conn)
         cur.execute(sql)
-        # A named (server-side) cursor's .description is not reliably
-        # populated until AFTER the first fetch -- psycopg2 only learns the
-        # result columns once an actual FETCH runs against the server-side
-        # cursor, not from DECLARE CURSOR alone. Reading it before fetching
-        # (as run()'s plain-cursor path safely can) returns None here and
-        # crashes. Fetch first, then read description.
-        rows = cur.fetchall()
+        # IMPORTANT: do not call cur.fetchall() here. On a psycopg2 NAMED
+        # (server-side) cursor, itersize only bounds fetches made through
+        # the cursor's iterator protocol -- .fetchall() ignores it and
+        # issues a single "FETCH ALL FROM <cursor>", pulling the entire
+        # remaining result set into one libpq allocation in one shot. That
+        # defeats the whole point of a server-side cursor and is exactly
+        # why "out of memory for query result" kept happening even after
+        # switching to a named cursor. Iterating the cursor instead makes
+        # psycopg2 issue bounded "FETCH FORWARD <itersize>" batches under
+        # the hood, so no single allocation ever has to hold more than one
+        # batch's worth of rows.
+        rows = [row for row in cur]
+        # A named cursor's .description is not reliably populated until
+        # AFTER the first fetch -- psycopg2 only learns the result columns
+        # once an actual FETCH runs against the server-side cursor, not
+        # from DECLARE CURSOR alone. Reading it before fetching (as run()'s
+        # plain-cursor path safely can) returns None here and crashes.
         cols = [d[0].upper() for d in cur.description]
         cur.close()
         return cols, rows
