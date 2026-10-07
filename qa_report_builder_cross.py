@@ -51,6 +51,7 @@ formatting before assuming the data itself is wrong.
 Run with: python qa_report_builder_cross.py
 """
 
+import numbers
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -471,12 +472,24 @@ def fetch_rows_by_keys(side, columns, join_key, keys):
     keys = list(keys)
     for i in range(0, len(keys), CHECKSUM_BATCH_SIZE):
         batch = keys[i:i + CHECKSUM_BATCH_SIZE]
-        # Standard SQL escaping (doubling embedded single quotes) -- a string
-        # join-key value containing a literal quote (e.g. an apostrophe)
-        # would otherwise break this query's syntax, the same class of bug
-        # NULL_SENTINEL had before it was fixed to avoid NUL bytes.
+        # Only genuinely numeric keys (int/float/Decimal) are safe to embed
+        # unquoted -- everything else (str, date, datetime, UUID, ...) needs
+        # to be a quoted string literal, or the engine tries to parse its
+        # bare text as something else. A real example: a native
+        # datetime.date key's str() form is "2025-02-19" -- left unquoted,
+        # Snowflake parses the hyphens as arithmetic subtraction
+        # ("2025 - 2 - 19") instead of a date literal. isinstance(k, str)
+        # alone used to decide this, which only handled the str-vs-int case
+        # and broke the first time a join key was a native date object.
+        # Standard SQL escaping (doubling embedded single quotes) still
+        # applies to the quoted form -- a key value containing a literal
+        # quote (e.g. an apostrophe) would otherwise break this query's
+        # syntax, the same class of bug NULL_SENTINEL had before it was
+        # fixed to avoid NUL bytes.
         quoted = ", ".join(
-            f"'{k.replace(chr(39), chr(39) * 2)}'" if isinstance(k, str) else str(k) for k in batch
+            str(k) if isinstance(k, numbers.Number) and not isinstance(k, bool)
+            else f"'{str(k).replace(chr(39), chr(39) * 2)}'"
+            for k in batch
         )
         _, rows = side.run(f"SELECT {select_list} FROM {side.fqn} WHERE {join_key} IN ({quoted})")
         for r in rows:
