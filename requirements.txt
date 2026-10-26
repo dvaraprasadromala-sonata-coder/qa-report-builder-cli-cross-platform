@@ -1,0 +1,5 @@
+snowflake-connector-python
+psycopg2-binary
+redshift_connector
+openpyxl
+duckdb

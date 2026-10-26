@@ -1,0 +1,6 @@
+venv/
+QA-CLI/
+__pycache__/
+*.pyc
+*.xlsx
+.env
